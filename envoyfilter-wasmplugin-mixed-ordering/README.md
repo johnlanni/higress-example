@@ -2,7 +2,7 @@
 
 ## 背景
 
-在 Higress/Istio 中，WasmPlugin 和 EnvoyFilter 都可以用于向 HTTP filter chain 中插入自定义过滤器。然而，在此功能之前，它们是分开处理的：
+在 Higress 中，WasmPlugin 和 EnvoyFilter 都可以用于向 HTTP filter chain 中插入自定义过滤器。然而，在此功能之前，它们是分开处理的：
 
 - **WasmPlugin** 按照 `phase` 和 `priority` 排序
 - **EnvoyFilter** 使用 `INSERT_BEFORE`/`INSERT_AFTER` 等操作定位
@@ -20,15 +20,15 @@ apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
   name: my-custom-filter
+  namespace: higress-system
 spec:
   wasmPhase: AUTHN    # 新增：指定参与混合排序的 phase
   wasmPriority: 50    # 新增：在同 phase 内的优先级（数值越大越靠前）
   configPatches:
     - applyTo: HTTP_FILTER
       match:
-        context: SIDECAR_OUTBOUND
+        context: GATEWAY
         listener:
-          portNumber: 8080
           filterChain:
             filter:
               name: envoy.filters.network.http_connection_manager
@@ -37,8 +37,14 @@ spec:
         value:
           name: my-custom-filter
           typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
-            # ... filter config
+            "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+            inline_code: |
+              function envoy_on_request(handle)
+                handle:logInfo("Custom filter executed")
+              end
+  workloadSelector:
+    labels:
+      higress: higress-system-higress-gateway
 ```
 
 ### Phase 类型
@@ -60,9 +66,9 @@ spec:
 
 ## 使用示例
 
-### 场景：在认证插件之后、授权插件之前插入自定义 filter
-
 参考 [example.yaml](./example.yaml)
+
+### 场景：在认证插件前后插入自定义 filter
 
 ```yaml
 # WasmPlugin - JWT 认证 (AUTHN phase, priority 100)
@@ -70,37 +76,29 @@ apiVersion: extensions.istio.io/v1alpha1
 kind: WasmPlugin
 metadata:
   name: jwt-auth
-  namespace: istio-system
+  namespace: higress-system
 spec:
   phase: AUTHN
   priority: 100
   url: oci://example.com/jwt-auth:v1
+  selector:
+    matchLabels:
+      higress: higress-system-higress-gateway
 ---
-# WasmPlugin - RBAC 授权 (AUTHZ phase, priority 100)
-apiVersion: extensions.istio.io/v1alpha1
-kind: WasmPlugin
-metadata:
-  name: rbac
-  namespace: istio-system
-spec:
-  phase: AUTHZ
-  priority: 100
-  url: oci://example.com/rbac:v1
----
-# EnvoyFilter - 自定义 filter (AUTHN phase, priority 50)
-# 会排在 jwt-auth 之后（因为 priority 50 < 100）
+# EnvoyFilter - 认证前处理 (AUTHN phase, priority 200)
+# 排在 jwt-auth 之前（因为 priority 200 > 100）
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
-  name: custom-authn-filter
-  namespace: istio-system
+  name: pre-authn-filter
+  namespace: higress-system
 spec:
   wasmPhase: AUTHN
-  wasmPriority: 50
+  wasmPriority: 200
   configPatches:
     - applyTo: HTTP_FILTER
       match:
-        context: SIDECAR_OUTBOUND
+        context: GATEWAY
         listener:
           filterChain:
             filter:
@@ -108,34 +106,58 @@ spec:
       patch:
         operation: ADD
         value:
-          name: custom-authn-filter
+          name: pre-authn-filter
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
             inline_code: |
               function envoy_on_request(handle)
-                handle:logInfo("Custom AUTHN filter executed")
+                handle:logInfo("Before JWT auth")
               end
+  workloadSelector:
+    labels:
+      higress: higress-system-higress-gateway
+---
+# EnvoyFilter - 认证后处理 (AUTHN phase, priority 50)
+# 排在 jwt-auth 之后（因为 priority 50 < 100）
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: post-authn-filter
+  namespace: higress-system
+spec:
+  wasmPhase: AUTHN
+  wasmPriority: 50
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+      patch:
+        operation: ADD
+        value:
+          name: post-authn-filter
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+            inline_code: |
+              function envoy_on_request(handle)
+                handle:logInfo("After JWT auth")
+              end
+  workloadSelector:
+    labels:
+      higress: higress-system-higress-gateway
 ```
 
 **最终 filter 顺序：**
 
 ```
-1. jwt-auth (WasmPlugin, AUTHN, priority=100)
-2. custom-authn-filter (EnvoyFilter, AUTHN, priority=50)
-3. [内置 authn filters]
-4. rbac (WasmPlugin, AUTHZ, priority=100)
-5. [内置 authz filters]
+1. pre-authn-filter (EnvoyFilter, AUTHN, priority=200)
+2. jwt-auth (WasmPlugin, AUTHN, priority=100)
+3. post-authn-filter (EnvoyFilter, AUTHN, priority=50)
+4. [内置 authn filters]
 ...
-```
-
-### 场景：多个 EnvoyFilter 与 WasmPlugin 混合
-
-```yaml
-# WasmPlugin A - priority 100
-# EnvoyFilter B - priority 80
-# EnvoyFilter C - priority 60
-
-# 最终顺序: wasm-a → filter-b → filter-c
 ```
 
 ## 注意事项
@@ -144,9 +166,9 @@ spec:
 
 2. **不指定 wasmPhase 时**：EnvoyFilter 使用传统的 `INSERT_BEFORE`/`INSERT_AFTER` 定位方式，不参与混合排序
 
-3. **Gateway 和 Sidecar 都支持**：此功能同时支持 Gateway 和 Sidecar 场景
+3. **workloadSelector**：在 Higress 中使用时，记得配置正确的 workloadSelector 以匹配网关实例
 
-4. **Waypoint 支持**：Ambient mesh 的 Waypoint 也支持此功能
+4. **context: GATEWAY**：Higress 网关场景使用 `context: GATEWAY`
 
 ## 兼容性
 

@@ -1,24 +1,25 @@
 # Example: EnvoyFilter 与 WasmPlugin 混合排序
 #
-# 本示例展示如何使用 wasmPhase 和 wasmPriority 字段
+# 本示例展示如何在 Higress 网关中使用 wasmPhase 和 wasmPriority 字段
 # 让 EnvoyFilter 与 WasmPlugin 进行混合排序
 #
 # 最终 filter 顺序:
-#   1. jwt-auth (WasmPlugin, AUTHN, priority=100)
-#   2. custom-authn-filter (EnvoyFilter, AUTHN, priority=50)
-#   3. [内置 authn filters]
-#   4. rbac (WasmPlugin, AUTHZ, priority=100)
-#   5. custom-authz-filter (EnvoyFilter, AUTHZ, priority=50)
-#   6. [内置 authz filters]
+#   1. pre-authn-filter (EnvoyFilter, AUTHN, priority=200)
+#   2. jwt-auth (WasmPlugin, AUTHN, priority=100)
+#   3. custom-authn-filter (EnvoyFilter, AUTHN, priority=50)
+#   4. [内置 authn filters]
+#   5. rbac (WasmPlugin, AUTHZ, priority=100)
+#   6. custom-authz-filter (EnvoyFilter, AUTHZ, priority=50)
+#   7. [内置 authz filters]
 
 ---
 # WasmPlugin - JWT 认证
-# Phase: AUTHN, Priority: 100 (最高优先级)
+# Phase: AUTHN, Priority: 100
 apiVersion: extensions.istio.io/v1alpha1
 kind: WasmPlugin
 metadata:
   name: jwt-auth
-  namespace: istio-system
+  namespace: higress-system
 spec:
   phase: AUTHN
   priority: 100
@@ -26,6 +27,9 @@ spec:
   pluginConfig:
     issuer: "https://example.com"
     jwksUri: "https://example.com/.well-known/jwks.json"
+  selector:
+    matchLabels:
+      higress: higress-system-higress-gateway
 
 ---
 # WasmPlugin - RBAC 授权
@@ -34,7 +38,7 @@ apiVersion: extensions.istio.io/v1alpha1
 kind: WasmPlugin
 metadata:
   name: rbac
-  namespace: istio-system
+  namespace: higress-system
 spec:
   phase: AUTHZ
   priority: 100
@@ -43,6 +47,44 @@ spec:
     rules:
       - path: "/api/*"
         methods: ["GET", "POST"]
+  selector:
+    matchLabels:
+      higress: higress-system-higress-gateway
+
+---
+# EnvoyFilter - 高优先级认证前处理
+# Phase: AUTHN, Priority: 200
+# 排在 jwt-auth (priority=100) 之前
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: pre-authn-filter
+  namespace: higress-system
+spec:
+  wasmPhase: AUTHN
+  wasmPriority: 200
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+      patch:
+        operation: ADD
+        value:
+          name: pre-authn-filter
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+            inline_code: |
+              function envoy_on_request(handle)
+                -- 在所有认证之前执行
+                handle:logInfo("Pre-authentication processing...")
+              end
+  workloadSelector:
+    labels:
+      higress: higress-system-higress-gateway
 
 ---
 # EnvoyFilter - 自定义认证后处理
@@ -52,14 +94,14 @@ apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
   name: custom-authn-filter
-  namespace: istio-system
+  namespace: higress-system
 spec:
   wasmPhase: AUTHN
   wasmPriority: 50
   configPatches:
     - applyTo: HTTP_FILTER
       match:
-        context: SIDECAR_OUTBOUND
+        context: GATEWAY
         listener:
           filterChain:
             filter:
@@ -78,6 +120,9 @@ spec:
                   handle:logInfo("JWT payload received: " .. jwt_payload)
                 end
               end
+  workloadSelector:
+    labels:
+      higress: higress-system-higress-gateway
 
 ---
 # EnvoyFilter - 自定义授权后处理
@@ -87,14 +132,14 @@ apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
   name: custom-authz-filter
-  namespace: istio-system
+  namespace: higress-system
 spec:
   wasmPhase: AUTHZ
   wasmPriority: 50
   configPatches:
     - applyTo: HTTP_FILTER
       match:
-        context: SIDECAR_OUTBOUND
+        context: GATEWAY
         listener:
           filterChain:
             filter:
@@ -110,35 +155,6 @@ spec:
                 -- 在 RBAC 授权之后执行
                 handle:logInfo("Request passed RBAC, proceeding...")
               end
-
----
-# EnvoyFilter - 高优先级认证前处理
-# Phase: AUTHN, Priority: 200
-# 排在 jwt-auth (priority=100) 之前
-apiVersion: networking.istio.io/v1alpha3
-kind: EnvoyFilter
-metadata:
-  name: pre-authn-filter
-  namespace: istio-system
-spec:
-  wasmPhase: AUTHN
-  wasmPriority: 200
-  configPatches:
-    - applyTo: HTTP_FILTER
-      match:
-        context: SIDECAR_OUTBOUND
-        listener:
-          filterChain:
-            filter:
-              name: envoy.filters.network.http_connection_manager
-      patch:
-        operation: ADD
-        value:
-          name: pre-authn-filter
-          typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
-            inline_code: |
-              function envoy_on_request(handle)
-                -- 在所有认证之前执行
-                handle:logInfo("Pre-authentication processing...")
-              end
+  workloadSelector:
+    labels:
+      higress: higress-system-higress-gateway
